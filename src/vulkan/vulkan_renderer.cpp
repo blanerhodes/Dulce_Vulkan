@@ -1,5 +1,5 @@
-#include "vulkan_renderer.h"
-
+#include "vulkan/vulkan_renderer.h"
+#include "platform_services.h"
 /* NOTE: the following variables I believe can be wiped in the transient arena
     - available extensions (only used for querying)
     - required extensions if i make it dynamic later
@@ -51,6 +51,7 @@ static VkSurfaceFormatKHR VulkanChooseSwapSurfaceFormat(VulkanContext* context);
 static VkPresentModeKHR VulkanChooseSwapPresentMode(VulkanContext* context);
 static VkExtent2D VulkanChooseSwapExtent(VulkanContext* context);
 static void VulkanCreateImageViews(VulkanContext* context);
+static void VulkanCreateGraphicsPipeline(VulkanContext* context);
 
 static void VulkanRendererInitialize(Win32StateHandles state_handles, VulkanContext* context) {
     VulkanCreateInstance(context);
@@ -444,4 +445,97 @@ static void VulkanCreateImageViews(VulkanContext* context) {
         VK_CHECK(vkCreateImageView(context->logical_device, &create_info, NULL, &context->swapchain_image_views[i]));
 
     }
+}
+
+static VkShaderModule VulkanCreateShaderModule(VulkanContext* context, DebugReadFileResult shader_code) {
+    VkShaderModuleCreateInfo create_info = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+    create_info.codeSize = shader_code.contents_size;
+    create_info.pCode = (u32*)shader_code.contents;
+
+    VkShaderModule shader_module;
+    VK_CHECK(vkCreateShaderModule(context->logical_device, &create_info, context->allocator, &shader_module));
+    return shader_module;
+}
+
+static void VulkanCreateGraphicsPipeline(VulkanContext* context) {
+    DebugReadFileResult vert_shader_code = DebugPlatformReadEntireFile("assets/shaders/starter.vert.glsl");
+    DebugReadFileResult frag_shader_code = DebugPlatformReadEntireFile("assets/shaders/starter.frag.glsl");
+
+    VkShaderModule vert_shader_module = VulkanCreateShaderModule(context, vert_shader_code);
+    VkShaderModule frag_shader_module = VulkanCreateShaderModule(context, frag_shader_code);
+
+    VkPipelineShaderStageCreateInfo vert_shader_stage_info = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    vert_shader_stage_info.stage = VK_SHADER_STAGE_VERTEX_BIT;
+    vert_shader_stage_info.module = vert_shader_module;
+    vert_shader_stage_info.pName = "main";
+    /*NOTE: SpecializationInfo is for specifying values for shader constants so allow the shader's behavior
+            to be configured at pipeline creation by giving different values to those constants.
+            This is more efficient than configuring the shader with variables at render time
+    */
+    vert_shader_stage_info.pSpecializationInfo = NULL;
+
+    VkPipelineShaderStageCreateInfo frag_shader_stage_info = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+    frag_shader_stage_info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+    frag_shader_stage_info.module = frag_shader_module;
+    frag_shader_stage_info.pName = "main";
+    frag_shader_stage_info.pSpecializationInfo = NULL;
+
+    VkPipelineShaderStageCreateInfo shader_stages[] = {vert_shader_stage_info, frag_shader_stage_info};
+
+    /*NOTE: Specifying values in dynamic state means they will be excluded from the preset configuration
+      and must be specified at drawing time. Viewport and scissor state are common to put here. 
+    */    
+    VkDynamicState dynamic_states[] = {VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
+    VkPipelineDynamicStateCreateInfo dynamic_state = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO};
+    dynamic_state.dynamicStateCount = ArrayCount(dynamic_states);
+    dynamic_state.pDynamicStates = dynamic_states;
+
+    /*NOTE: Describes the format of the vertex data that is passed to the vertex shader in 2 ways
+        - Bindings: Spacing between data and if the data is per-vertex or per-instance
+        - Attribute descriptions: Type of attrs passed to vertex shader, which binding to load them from
+                                  and at which offset
+    */
+    VkPipelineVertexInputStateCreateInfo vertex_input_info = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO};
+    vertex_input_info.vertexBindingDescriptionCount = 0;
+    vertex_input_info.pVertexBindingDescriptions = NULL;
+    vertex_input_info.vertexAttributeDescriptionCount = 0;
+    vertex_input_info.pVertexAttributeDescriptions = NULL;
+
+    /*NOTE: Describes what kind of geometry will be drawn and enable primitiveRestart to break up
+            lines and triangles into a _STRIP topology
+    */
+    VkPipelineInputAssemblyStateCreateInfo input_assembly = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO};
+    input_assembly.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    input_assembly.primitiveRestartEnable = VK_FALSE;
+
+    /*NOTE: Describes the region of the framebuffer that the output will be rendered to.
+            Defines the transformation from the image to the framebuffer.
+            Want to use the swapchain extent since the swapchain image size can differ from the window
+            width/height. Stick to swapchain size since the swapchain will be used as framebuffers
+    */
+    VkViewport viewport = {};
+    viewport.x = 0.0f;
+    viewport.y = 0.0f;
+    viewport.width = (f32) context->swapchain_extent.width;
+    viewport.height = (f32) context->swapchain_extent.height;
+    viewport.minDepth = 0.0f;
+    viewport.maxDepth = 1.0f;
+
+    /*NOTE: Defines in which regions pixels will actually be stored. Any pixels outside the scissor
+            will be discarded by the rasterizer. Basically filters out what's outside of it.
+    */
+    VkRect2D scissor = {};
+    scissor.offset = {0, 0};
+    scissor.extent = context->swapchain_extent;
+
+    VkPipelineViewportStateCreateInfo viewport_state = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO};
+    viewport_state.viewportCount = 1;
+    viewport_state.scissorCount = 1;
+    /*NOTE: set these for non-dynamic state
+    viewport_state.pViewports = &viewports;
+    viewport_state.pScissors = &scissors
+    */
+
+    vkDestroyShaderModule(context->logical_device, vert_shader_module, context->allocator);
+    vkDestroyShaderModule(context->logical_device, frag_shader_module, context->allocator);
 }

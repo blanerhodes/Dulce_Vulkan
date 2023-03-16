@@ -1,9 +1,6 @@
 #pragma once
 
-struct DebugReadFileResult {
-    u32 contents_size;
-    void* contents;
-};
+#include "platform_services.h"
 
 DebugReadFileResult DebugPlatformReadEntireFile(char* filename);
 void DebugPlatformFreeFileMemory(void* memory);
