@@ -178,8 +178,7 @@ static LRESULT CALLBACK Win32MainWindowCallback(HWND window, UINT message, WPARA
 static void Win32ArenaAlloc(MemoryArena* arena, u64 size) {
     //TODO: check for page aligned allocations
     arena->size = size; 
-    arena->base = VirtualAlloc(0, size, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE);
-    arena->offset = arena->base;
+    arena->used = 0;
 }
 
 int main(void) {
@@ -214,7 +213,11 @@ int main(void) {
     state_handles.hInstance = instance;
     u64 renderer_memory_requirement = MegaBytes(1);
     VulkanContext vulkan_context = {};
-    Win32ArenaAlloc(&vulkan_context.transient_memory, renderer_memory_requirement);
+    vulkan_context.frame_buffer_width = window_width;
+    vulkan_context.frame_buffer_height = window_height;
+    vulkan_context.allocator = 0;
+    InitializeArena(&vulkan_context.transient_memory, renderer_memory_requirement, 
+        (u8*)VirtualAlloc(0, renderer_memory_requirement, MEM_RESERVE|MEM_COMMIT, PAGE_READWRITE));
     VulkanRendererInitialize(state_handles, &vulkan_context);
 
     global_running = true;

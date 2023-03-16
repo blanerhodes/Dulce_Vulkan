@@ -10,7 +10,8 @@
 /* NOTE: the following variables I believe will need to stick around (maybe not the whole alloc though, just one thats picked)
     - swapchain formats
     - swapchain present_modes
-
+    - swapchain images
+    - swapchain image views
 */
 
 VKAPI_ATTR VkBool32 VKAPI_CALL vkDebugCallback(
@@ -44,8 +45,12 @@ static VulkanQueueFamilyInfo VulkanFindQueueFamilies(VulkanContext* context, VkP
 static b8 VulkanIsDeviceSuitable(VulkanContext* context, VkPhysicalDevice device);
 static void VulkanSelectDevice(VulkanContext* context);
 static void VulkanCreateLogicalDevice(VulkanContext* context);
-static b8 VulkanQuerySwapchainSupport(VulkanContext* context);
-static VkSurfaceFormatKHR VulkanChooseSwapSurfaceFormat(VulkanContext* context) {
+static void VulkanCreateSwapchain(VulkanContext* context);
+static b8 VulkanQuerySwapchainSupport(VulkanContext* context, VkPhysicalDevice device);
+static VkSurfaceFormatKHR VulkanChooseSwapSurfaceFormat(VulkanContext* context);
+static VkPresentModeKHR VulkanChooseSwapPresentMode(VulkanContext* context);
+static VkExtent2D VulkanChooseSwapExtent(VulkanContext* context);
+static void VulkanCreateImageViews(VulkanContext* context);
 
 static void VulkanRendererInitialize(Win32StateHandles state_handles, VulkanContext* context) {
     VulkanCreateInstance(context);
@@ -53,11 +58,16 @@ static void VulkanRendererInitialize(Win32StateHandles state_handles, VulkanCont
     VulkanCreateSurface(context, state_handles);
     VulkanSelectDevice(context);
     VulkanCreateLogicalDevice(context);
+    VulkanCreateSwapchain(context);
+    VulkanCreateImageViews(context);
 }
 
 static void VulkanRendererShutdown(VulkanContext* context) {
+    for (u32 i = 0; i < context->swapchain_image_count; i++) {
+        vkDestroyImageView(context->logical_device, context->swapchain_image_views[i], context->allocator);
+    }
+    vkDestroySwapchainKHR(context->logical_device, context->swapchain, 0);
     vkDestroyDevice(context->logical_device, NULL);
-
     PFN_vkDestroyDebugUtilsMessengerEXT func = (PFN_vkDestroyDebugUtilsMessengerEXT)vkGetInstanceProcAddr(context->instance, "vkDestroyDebugUtilsMessengerEXT");
     func(context->instance, context->debug_messenger, NULL);
     vkDestroySurfaceKHR(context->instance, context->surface, NULL);
@@ -125,6 +135,7 @@ static b8 VulkanCreateSurface(VulkanContext* context, Win32StateHandles state_ha
         DFATAL("Vulkan surface creation failed.");
         return false;
     }
+    DINFO("Vulkan surface created.")
     return true;
 }
 
@@ -135,8 +146,8 @@ static VulkanQueueFamilyInfo VulkanFindQueueFamilies(VulkanContext* context, VkP
 
     u32 queue_family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, NULL);
-    VkQueueFamilyProperties* queue_properties =
-        (VkQueueFamilyProperties*)ArenaReserveBytes(&context->transient_memory, sizeof(VkQueueFamilyProperties) * queue_family_count);
+    VkQueueFamilyProperties* queue_properties = 
+        PushArray(&context->transient_memory, queue_family_count, VkQueueFamilyProperties);
     vkGetPhysicalDeviceQueueFamilyProperties(device, &queue_family_count, queue_properties);
 
     for (u32 i = 0; i < queue_family_count; i++) {
@@ -151,6 +162,7 @@ static VulkanQueueFamilyInfo VulkanFindQueueFamilies(VulkanContext* context, VkP
     }
     return result;
 }
+
 //TODO: bundle device requirements because they're all over the place
 static b8 VulkanIsDeviceSuitable(VulkanContext* context, VkPhysicalDevice device) {
     char* required_extensions[] = {VK_KHR_SWAPCHAIN_EXTENSION_NAME}; 
@@ -159,7 +171,7 @@ static b8 VulkanIsDeviceSuitable(VulkanContext* context, VkPhysicalDevice device
     u32 extension_count;
     vkEnumerateDeviceExtensionProperties(device, NULL, &extension_count, NULL);
     VkExtensionProperties* extensions = 
-        (VkExtensionProperties*)ArenaReserveBytes(&context->transient_memory, sizeof(VkExtensionProperties) * extension_count);
+        PushArray(&context->transient_memory, extension_count, VkExtensionProperties);
     vkEnumerateDeviceExtensionProperties(device, NULL, &extension_count, extensions);
 
     for (u32 i = 0; i < ArrayCount(required_extensions); i++) {
@@ -174,8 +186,8 @@ static b8 VulkanIsDeviceSuitable(VulkanContext* context, VkPhysicalDevice device
     }
 
     //TODO: need to rework this stuff to not be setting values in the context before the values are confirmed to be valid
-    b8 swapchain_sufficient = VulkanQuerySwapchainSupport(context);
     //NOTE: have to query swapchain after querying extensions
+    b8 swapchain_sufficient = VulkanQuerySwapchainSupport(context, device);
     if (context->queue_family_info.graphics_family_index != -1    && 
             context->queue_family_info.present_family_index != -1 &&
             swapchain_sufficient) {
@@ -210,6 +222,7 @@ static void VulkanSelectDevice(VulkanContext* context) {
         DFATAL("VulkanSelectDevice - Could not find suitable physical device.");
         return;
     }
+    DINFO("Vulkan device selected.");
 }
 
 static void VulkanCreateLogicalDevice(VulkanContext* context) {
@@ -249,15 +262,85 @@ static void VulkanCreateLogicalDevice(VulkanContext* context) {
     vkGetDeviceQueue(context->logical_device, context->queue_family_info.present_family_index, 0, &context->present_queue);
 }
 
-static b8 VulkanQuerySwapchainSupport(VulkanContext* context) {
-    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(context->physical_device, context->surface,
+static void VulkanCreateSwapchain(VulkanContext* context) {
+    VulkanQuerySwapchainSupport(context, context->physical_device);
+    /*NOTE: need the next 3 functions for swapchain settings
+        - Surface format (color depth)
+        - Presentation mode (conditions for swapping the images to the screen)
+        - Swap extent (resolution of images in the swapchain)
+    */
+    VkSurfaceFormatKHR surface_format = VulkanChooseSwapSurfaceFormat(context);
+    VkPresentModeKHR present_mode = VulkanChooseSwapPresentMode(context);
+    VkExtent2D extent = VulkanChooseSwapExtent(context);
+
+    context->swapchain_image_format = surface_format;
+    context->swapchain_extent = extent;
+
+    VulkanSwapchainSupportInfo* swapchain_info = &context->swapchain_support;
+    u32 image_count = swapchain_info->capabilities.minImageCount + 1;
+    if (swapchain_info->capabilities.maxImageCount > 0 && image_count > swapchain_info->capabilities.maxImageCount) {
+        image_count = swapchain_info->capabilities.maxImageCount;
+    }
+
+    VkSwapchainCreateInfoKHR create_info = {VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR};
+    create_info.surface = context->surface;
+    create_info.minImageCount = image_count;
+    create_info.imageFormat = surface_format.format;
+    create_info.imageColorSpace = surface_format.colorSpace;
+    create_info.imageExtent = extent;
+    create_info.imageArrayLayers = 1; //NOTE: always 1 unless doing stereoscopic 3D, so never
+    /*NOTE: imageUsage specs what ops we'll use the images in the swapchain for
+            since right now we render directly to them, we use color attachment.
+            Can render to a separate image first to perform ops like post processing with VK_IMAGE_USAGE_TRANSFER_DST_BIT
+            and use a memory op to transfer the rendered image to a swapchain image
+    */
+    create_info.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT; 
+
+    /*NOTE: drawing from the graphics queue then submitting on the presentation queue
+            - VK_SHARING_MODE_EXCLUSIVE: image is owned by one queue family at a time and ownership must be
+                explicitly transferred, best for performance
+            - VK_SHARING_MODE_CONCURRENT: iamges can be used across queue families without explicity transfers
+    */
+    if (context->queue_family_info.graphics_family_index != context->queue_family_info.present_family_index) {
+        u32 queue_family_indices[] {context->queue_family_info.graphics_family_index, context->queue_family_info.present_family_index};
+        create_info.imageSharingMode = VK_SHARING_MODE_CONCURRENT;
+        create_info.queueFamilyIndexCount = 2;
+        create_info.pQueueFamilyIndices = queue_family_indices;
+    } else {
+        create_info.imageSharingMode = VK_SHARING_MODE_EXCLUSIVE;
+        create_info.queueFamilyIndexCount = 0;
+        create_info.pQueueFamilyIndices = 0;
+    }
+    //NOTE: specify a transform that should be applied to all images in a swapchain, currentTransform == no transform
+    create_info.preTransform = swapchain_info->capabilities.currentTransform;
+    //NOTE: almost always ignore since this is for blending with other windows in the window system
+    create_info.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
+    create_info.presentMode = present_mode;
+    create_info.clipped = VK_TRUE;
+    /*NOTE: This is for if the swapchain becomes invalid or unoptimized like with a window resize.
+            If this happens then the swapchain needs to be recreated and needs a ref to the old swapchain
+    */
+    create_info.oldSwapchain = VK_NULL_HANDLE;
+
+    VK_CHECK(vkCreateSwapchainKHR(context->logical_device, &create_info, NULL, &context->swapchain));
+
+    u32 swapchain_image_count;
+    vkGetSwapchainImagesKHR(context->logical_device, context->swapchain, &swapchain_image_count, NULL);
+    context->swapchain_images = PushArray(&context->transient_memory, swapchain_image_count, VkImage);
+    vkGetSwapchainImagesKHR(context->logical_device, context->swapchain, &swapchain_image_count, context->swapchain_images);
+    context->swapchain_image_count = swapchain_image_count;
+    DINFO("Swapchain created.");
+}
+
+static b8 VulkanQuerySwapchainSupport(VulkanContext* context, VkPhysicalDevice device) {
+    VK_CHECK(vkGetPhysicalDeviceSurfaceCapabilitiesKHR(device, context->surface,
                                               &context->swapchain_support.capabilities));
     //TODO: do the format and present mode allocations need to be part of permanent memory?
     u32 format_count = 0;
-    VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(context->physical_device, context->surface, &format_count, NULL));
+    VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(device, context->surface, &format_count, NULL));
 
     u32 present_mode_count = 0;
-    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(context->physical_device, context->surface, &present_mode_count, NULL));
+    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(device, context->surface, &present_mode_count, NULL));
 
     //TODO: does this need to be fatal
     if (!format_count || !present_mode_count) {
@@ -265,21 +348,19 @@ static b8 VulkanQuerySwapchainSupport(VulkanContext* context) {
         return false;
     }
 
-    context->swapchain_support.formats = 
-        (VkSurfaceFormatKHR*)ArenaReserveBytes(&context->transient_memory,
-                                                sizeof(VkSurfaceFormatKHR) * format_count);
-    VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(context->physical_device, context->surface, &format_count, context->swapchain_support.formats));
+    context->swapchain_support.formats = PushArray(&context->transient_memory, format_count, VkSurfaceFormatKHR);
+    VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(device, context->surface, &format_count, context->swapchain_support.formats));
     context->swapchain_support.format_count = format_count;
     context->swapchain_support.present_modes =
-        (VkPresentModeKHR*)ArenaReserveBytes(&context->transient_memory,
-                                             sizeof(VkPresentModeKHR) * present_mode_count);
-    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(context->physical_device,
+        PushArray(&context->transient_memory, present_mode_count, VkPresentModeKHR);
+    VK_CHECK(vkGetPhysicalDeviceSurfacePresentModesKHR(device,
                                                        context->surface,
                                                        &present_mode_count,
                                                        context->swapchain_support.present_modes));
     context->swapchain_support.present_mode_count = present_mode_count;
     return true;;
 }
+
 
 static VkSurfaceFormatKHR VulkanChooseSwapSurfaceFormat(VulkanContext* context) {
     VkSurfaceFormatKHR* formats = context->swapchain_support.formats;
@@ -306,5 +387,61 @@ static VkSurfaceFormatKHR VulkanChooseSwapSurfaceFormat(VulkanContext* context) 
                                    can be used to render as fast as possible without tearing (aka triple buffering)
 */
 static VkPresentModeKHR VulkanChooseSwapPresentMode(VulkanContext* context) {
-    VkPresentModeKHR* present_modes = context->swapchain_
+    VkPresentModeKHR* present_modes = context->swapchain_support.present_modes;
+    for (u32 i = 0; i < context->swapchain_support.present_mode_count; i++) {
+        if (present_modes[i] == VK_PRESENT_MODE_MAILBOX_KHR) {
+            return present_modes[i];
+        }
+    }
+    return VK_PRESENT_MODE_FIFO_KHR;
+}
+
+/* NOTE: swap extent is the resolution of the swap chain images (almost always exactly the resolution of the window we draw into in pixels)
+         range of possible resolutions is defined in VkSurfaceCapabilitiesKHR
+
+*/
+static VkExtent2D VulkanChooseSwapExtent(VulkanContext* context) {
+    VkSurfaceCapabilitiesKHR* capabilities = &context->swapchain_support.capabilities;
+    if (capabilities->currentExtent.width != UINT32_MAX) {
+        return capabilities->currentExtent;
+    } else {
+        VkExtent2D min = capabilities->minImageExtent;
+        VkExtent2D max = capabilities->maxImageExtent;
+        VkExtent2D actual_extent = {context->frame_buffer_width, context->frame_buffer_height};
+        actual_extent.width = DCLAMP(actual_extent.width, min.width, max.width);
+        actual_extent.height = DCLAMP(actual_extent.height, min.height, max.height);
+        return actual_extent;
+    }
+}
+
+/*NOTE: need a VkImageView to actually use any VkImage, even in the swapchain
+        Describes how to access the image and which part of it to access
+*/
+static void VulkanCreateImageViews(VulkanContext* context) {
+    context->swapchain_image_views = PushArray(&context->transient_memory,
+                                               context->swapchain_image_count,
+                                               VkImageView);
+    for (u32 i = 0; i < context->swapchain_image_count; i++) {
+        VkImageViewCreateInfo create_info = {VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+        create_info.image = context->swapchain_images[i];
+        create_info.viewType = VK_IMAGE_VIEW_TYPE_2D;
+        create_info.format = context->swapchain_image_format.format;
+        //NOTE: the components are how the image values should be mapped (like you can map all channels to red for a monochrome texture)
+        create_info.components.r = VK_COMPONENT_SWIZZLE_IDENTITY;
+        create_info.components.g = VK_COMPONENT_SWIZZLE_IDENTITY;
+        create_info.components.b = VK_COMPONENT_SWIZZLE_IDENTITY;
+        create_info.components.a = VK_COMPONENT_SWIZZLE_IDENTITY;
+        //NOTE: subresourceRange describes the image's purpose and which part should be accessed
+        //currently the below means the images are color targets w/o any mipmapping levels or multiple layers
+        create_info.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+        create_info.subresourceRange.baseMipLevel = 0;
+        create_info.subresourceRange.levelCount = 1;
+        //NOTE: if you do stereographic 3D then you would make a swapchain with multiple layers for multiple image views
+        //for each image for the left and right eyes
+        create_info.subresourceRange.baseArrayLayer = 0;
+        create_info.subresourceRange.layerCount = 1;
+
+        VK_CHECK(vkCreateImageView(context->logical_device, &create_info, NULL, &context->swapchain_image_views[i]));
+
+    }
 }

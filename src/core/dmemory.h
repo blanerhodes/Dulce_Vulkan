@@ -3,6 +3,6 @@
 
 struct MemoryArena {
     u64 size;
-    void* base;
-    void* offset;
+    u8* base;
+    u64 used;
 };
